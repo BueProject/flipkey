@@ -26,7 +26,7 @@ The program connects to the internet only if you tick **Check for updates once a
 
 ## Known limits
 
-- Capitals can't be recovered from text typed on the Hebrew keyboard if Shift did not produce them.
+- An English word typed on the Hebrew keyboard may lose its capitals, so `YouTube` can become `youtube`.
 - On a line that wraps, only the visible part with the cursor is flipped.
 - Every word on the line flips except all-capital English words, including words that were already correct. Highlight only the wrong part, or use the one-word shortcut, for those lines.
 - For languages that share an alphabet, such as English and French, the letters can't show the language. FlipKey converts the whole line from the keyboard currently active, so press the hotkey before switching keyboards. Letters made with two key presses, like `ê`, may stay as they are.
