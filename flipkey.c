@@ -19,6 +19,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <winhttp.h>
+#include <bcrypt.h>
 #include <wchar.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,7 +31,7 @@
 #define NIN_BALLOONUSERCLICK (WM_USER + 5)
 #endif
 
-#define APP_VER     "1.6"
+#define APP_VER     "1.7"
 #define WIDEN_(x)   L##x
 #define WIDEN(x)    WIDEN_(x)
 #define APP_VERSION WIDEN(APP_VER)
@@ -55,6 +56,7 @@
 #define HOTKEY_WORD 2
 
 #define BUF_MAX     4096
+#define UNDO_MS     30000
 #define SIDE_A   0
 #define SIDE_B   1
 #define MODE_ALL    0
@@ -71,6 +73,7 @@ static HKL   g_hkl[2];
 static WCHAR g_undoBefore[BUF_MAX + 1];
 static WCHAR g_undoAfter[BUF_MAX + 1];
 static HWND  g_undoWnd;
+static DWORD g_undoTick;              /* when the last flip happened */
 
 static HHOOK g_captureHook;           /* exists only while "Set key..." is listening */
 static HANDLE g_flipEvent;
@@ -85,6 +88,7 @@ static HWND  g_settings;
 static volatile LONG g_autoUpdate;    /* off unless the user ticked the box */
 static WCHAR g_updateVer[32];
 static WCHAR g_updateUrl[512];
+static char  g_updateHash[80];         /* "sha256:..." published by GitHub, if any */
 static volatile LONG g_installing;
 
 static HWND  g_wnd;
@@ -447,7 +451,7 @@ static void SwitchLayout(HWND fg, int layout)
     PostMessageW(target, WM_INPUTLANGCHANGEREQUEST, 0, (LPARAM)g_hkl[layout]);
 }
 
-/* ---------- clipboard, used only for selected text ---------- */
+/* ---------- clipboard ---------- */
 typedef struct { UINT fmt; HGLOBAL mem; } SavedFmt;
 typedef struct { SavedFmt *items; int n; } SavedClip;
 
@@ -567,7 +571,14 @@ static int NeedsPaste(const WCHAR *s, size_t n)
    Editors such as VS Code copy the whole line when nothing is highlighted, which
    is recognised by its single line break at the end and treated as nothing.
    Several highlighted lines have a break earlier too, so they count as a selection. */
-static WCHAR *CopySelected(int waitMs)
+static int IsOneLineWithBreak(const WCHAR *text, size_t n)
+{
+    size_t body = n;
+    while (body > 0 && (text[body - 1] == L'\n' || text[body - 1] == L'\r')) body--;
+    return body < n && wcscspn(text, L"\r\n") >= body;
+}
+
+static WCHAR *CopySelected(int waitMs, int *copiedLine)
 {
     DWORD seq = GetClipboardSequenceNumber();
     WCHAR *text;
@@ -582,8 +593,8 @@ static WCHAR *CopySelected(int waitMs)
     Sleep(20); /* let the application finish writing the clipboard */
     text = ReadClipboardText();
     n = text ? wcslen(text) : 0;
-    if (n == 0 || (n && wcscspn(text, L"\r\n") >= n - 2 &&
-                   (text[n - 1] == L'\n' || text[n - 1] == L'\r'))) {
+    if (n == 0 || IsOneLineWithBreak(text, n)) {
+        if (n && copiedLine) *copiedLine = 1;
         free(text);
         return NULL;
     }
@@ -599,13 +610,14 @@ static int ComputeFlip(const WCHAR *text, size_t n, int mode, int layout, HWND f
     memcpy(out, text, (n + 1) * sizeof(WCHAR));
 
     /* Pressing again: the text still ends with our last result, so put back the original. */
-    if (g_undoWnd == fg && alen && alen <= n &&
+    if (g_undoWnd == fg && alen && alen <= n && GetTickCount() - g_undoTick < UNDO_MS &&
         !memcmp(text + n - alen, g_undoAfter, alen * sizeof(WCHAR))) {
         static WCHAR tmp[BUF_MAX + 1];
         memcpy(out + n - alen, g_undoBefore, alen * sizeof(WCHAR));
         wcscpy(tmp, g_undoBefore);
         wcscpy(g_undoBefore, g_undoAfter);
         wcscpy(g_undoAfter, tmp);
+        g_undoTick = GetTickCount();
         return layout == SIDE_B ? SIDE_A : SIDE_B;
     }
 
@@ -621,6 +633,7 @@ static int ComputeFlip(const WCHAR *text, size_t n, int mode, int layout, HWND f
         wcscpy(g_undoBefore, text + start);
         wcscpy(g_undoAfter, out + start);
         g_undoWnd = fg;
+        g_undoTick = GetTickCount();
     } else {
         g_undoAfter[0] = 0;
     }
@@ -640,14 +653,17 @@ static void FlipNow(HWND fg, int layout, int mode)
     SavedClip saved;
     WCHAR *text, *out;
     size_t n;
-    int target;
+    int target, copiedLine = 0;
+    WCHAR cls[32] = L"";
 
     SaveClipboard(&saved);
-    text = CopySelected(150);
-    if (!text) {
+    text = CopySelected(150, &copiedLine);
+    GetClassNameW(fg, cls, 32);
+    /* Excel copies the cell when it is not being edited; Shift+Home would extend the selection. */
+    if (!text && !(copiedLine && !lstrcmpW(cls, L"XLMAIN"))) {
         SendShiftHome();
         Sleep(30);
-        text = CopySelected(300);
+        text = CopySelected(300, NULL);
     }
     if (!text) {
         RestoreClipboard(&saved);
@@ -719,7 +735,7 @@ static void HotkeyName(DWORD vk, DWORD mods, WCHAR *out)
 static const WCHAR *HotkeyProblem(DWORD vk, DWORD mods)
 {
     int standalone = (vk >= VK_F1 && vk <= VK_F24) || vk == VK_PAUSE ||
-                     vk == VK_SCROLL || vk == VK_INSERT;
+                     vk == VK_INSERT;
     if (vk == VK_CAPITAL || vk == VK_NUMLOCK || IsModifierOrIgnored(vk))
         return L"That key can't be used. Try another.";
     if (mods & MOD_WIN)
@@ -922,16 +938,51 @@ static const char *JsonValue(const char *from, const char *key, char *out, size_
     return q;
 }
 
-/* Finds the version and the program's download link in GitHub's release data. */
-static int ParseRelease(const char *json, char *tag, size_t tagSize, char *url, size_t urlSize)
+/* Finds the version, the program's download link and its published fingerprint. */
+static int ParseRelease(const char *json, char *tag, size_t tagSize, char *url, size_t urlSize,
+                        char *digest, size_t digestSize)
 {
-    const char *p = json;
+    const char *assetStart = json, *p = json, *next;
+    digest[0] = 0;
     if (!JsonValue(json, "\"tag_name\"", tag, tagSize)) return 0;
-    while ((p = JsonValue(p, "\"browser_download_url\"", url, urlSize)) != NULL) {
+    while ((next = JsonValue(p, "\"browser_download_url\"", url, urlSize)) != NULL) {
         size_t n = strlen(url);
-        if (n > 4 && !_stricmp(url + n - 4, ".exe")) return 1;
+        if (n > 4 && !_stricmp(url + n - 4, ".exe")) {
+            /* The fingerprint comes earlier in the same asset's entry. */
+            const char *d = strstr(assetStart, "\"digest\"");
+            if (d && d < next) JsonValue(d, "\"digest\"", digest, digestSize);
+            return 1;
+        }
+        p = assetStart = next;
     }
     return 0;
+}
+
+/* Writes "sha256:" plus lowercase hex. Returns 0 on failure. */
+static int Sha256Text(const char *data, DWORD len, char *out, size_t size)
+{
+    BCRYPT_ALG_HANDLE alg = NULL;
+    BCRYPT_HASH_HANDLE hash = NULL;
+    UCHAR digest[32];
+    int ok = 0, i;
+    if (size < 72) return 0;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0) != 0) return 0;
+    if (BCryptCreateHash(alg, &hash, NULL, 0, NULL, 0, 0) == 0) {
+        if (BCryptHashData(hash, (PUCHAR)data, len, 0) == 0 &&
+            BCryptFinishHash(hash, digest, 32, 0) == 0)
+            ok = 1;
+        BCryptDestroyHash(hash);
+    }
+    BCryptCloseAlgorithmProvider(alg, 0);
+    if (!ok) return 0;
+    memcpy(out, "sha256:", 7);
+    for (i = 0; i < 32; i++) {
+        static const char hex[] = "0123456789abcdef";
+        out[7 + i * 2] = hex[digest[i] >> 4];
+        out[8 + i * 2] = hex[digest[i] & 15];
+    }
+    out[71] = 0;
+    return 1;
 }
 
 static char *HttpGet(const WCHAR *url, DWORD *lenOut)
@@ -994,7 +1045,7 @@ static void CheckForUpdate(void)
     DWORD len;
     char *json = HttpGet(L"https://api.github.com" RELEASE_PATH, &len);
     if (!json) return;
-    if (ParseRelease(json, tag, sizeof tag, url, sizeof url) &&
+    if (ParseRelease(json, tag, sizeof tag, url, sizeof url, g_updateHash, sizeof g_updateHash) &&
         VersionNumber(tag) > VersionNumber(APP_VER) &&
         MultiByteToWideChar(CP_UTF8, 0, url, -1, g_updateUrl, 512)) {
         const char *t = (tag[0] == 'v' || tag[0] == 'V') ? tag + 1 : tag;
@@ -1065,7 +1116,11 @@ static DWORD WINAPI InstallThread(LPVOID unused)
     GetModuleFileNameW(NULL, exe, MAX_PATH);
     data = HttpGet(g_updateUrl, &len);
     if (data) {
-        ok = InstallBytes(exe, data, len);
+        char actual[80];
+        /* A published fingerprint must match; otherwise the file is not installed. */
+        if (!g_updateHash[0] ||
+            (Sha256Text(data, len, actual, sizeof actual) && !_stricmp(actual, g_updateHash)))
+            ok = InstallBytes(exe, data, len);
         free(data);
     }
     if (ok) {
@@ -1237,7 +1292,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM w, LPARAM l)
             HKL b = (HKL)SendDlgItemMessageW(h, IDC_LANGB, CB_GETITEMDATA,
                         SendDlgItemMessageW(h, IDC_LANGB, CB_GETCURSEL, 0, 0), 0);
             if (g_capturing) return 0;
-            if (a == b) {
+            if (a == b || a == (HKL)(LONG_PTR)CB_ERR || b == (HKL)(LONG_PTR)CB_ERR) {
                 SetDlgItemTextW(h, IDC_ERROR, L"Pick two different languages.");
                 return 0;
             }
@@ -1297,7 +1352,7 @@ static void FillLanguages(int id, HKL current)
             SendDlgItemMessageW(g_settings, id, CB_SETCURSEL, i, 0);
 }
 
-/* Blocks until the window closes; hooks and timers keep running inside this loop. */
+/* Blocks until the window closes; other messages keep being handled inside this loop. */
 static void RunSettings(int firstRun)
 {
     static int registered;

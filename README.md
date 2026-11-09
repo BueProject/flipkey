@@ -14,15 +14,16 @@ Windows SmartScreen may warn you because the program is not code-signed.
 
 - **Your hotkey** (F10, Ctrl + L, or your own) flips the highlighted text, or the current line from its start to the cursor.
 - **One-word shortcut:** your hotkey plus Ctrl (or plus Shift if it already has Ctrl) flips only the last word.
-- **Press again** to restore the original.
+- **Press again** within 30 seconds to restore the original.
 - **Lines wrong in both directions** are handled word by word for languages with different alphabets: `tbh ודנ` becomes `אני usb`.
 - **Words in all capital English letters stay as they are**, so `USB` is never flipped.
+- **To change your languages, key or other settings,** click the FlipKey icon in the system tray and choose "Change hotkey".
 
 ## Privacy
 
-FlipKey does not record or watch your typing. Windows tells it only when the hotkey is pressed. The clipboard is used briefly during a flip and then restored.
+FlipKey does not record or watch your typing. Windows tells it only when the hotkey is pressed. The clipboard is used briefly during a flip and then restored, so flipped text can appear in your Windows clipboard history (Win+V) if that is turned on.
 
-The program connects to the internet only if you tick **Check for updates once a day**, which is off by default. It then asks GitHub for the latest version, and nothing is installed until you agree.
+The program connects to the internet only if you tick **Check for updates once a day**, which is off by default. It then asks GitHub for the latest version, and nothing is installed until you agree. A download is installed only if it matches the fingerprint GitHub publishes for it.
 
 ## Known limits
 
@@ -38,7 +39,7 @@ The program connects to the internet only if you tick **Check for updates once a
 With [Zig](https://ziglang.org):
 
 ```
-zig cc -target x86_64-windows-gnu -Os -s -Wl,--subsystem,windows flipkey.c flipkey.rc -o FlipKey.exe -luser32 -lgdi32 -lshell32 -ladvapi32 -lwinhttp
+zig cc -target x86_64-windows-gnu -Os -s -Wl,--subsystem,windows flipkey.c flipkey.rc -o FlipKey.exe -luser32 -lgdi32 -lshell32 -ladvapi32 -lwinhttp -lbcrypt
 ```
 
 ## License
