@@ -2,13 +2,13 @@
  *
  *   Hotkey    flips the highlighted text, or the current line from its start to the cursor
  *   Word key  flips only the last word (Ctrl+hotkey, or Shift added if it has Ctrl)
- *   Hotkey again restores the previous text exactly
+ *   Hotkey again, soon after, restores the previous text
  *
  * Nothing watches the keyboard: Windows only signals FlipKey when the hotkey is pressed.
  *
  * With different alphabets each word is flipped by its own alphabet, so a line can be
  * wrong in both directions. With a shared alphabet the current keyboard decides.
- * A word written entirely in capital English letters is left alone.
+ * A single word written entirely in capital English letters, on its own, is left alone.
  * The character tables are read from the keyboards installed in Windows.
  */
 #define WIN32_LEAN_AND_MEAN
@@ -31,7 +31,7 @@
 #define NIN_BALLOONUSERCLICK (WM_USER + 5)
 #endif
 
-#define APP_VER     "1.7"
+#define APP_VER     "1.9"
 #define WIDEN_(x)   L##x
 #define WIDEN(x)    WIDEN_(x)
 #define APP_VERSION WIDEN(APP_VER)
@@ -86,6 +86,7 @@ static volatile LONG g_capturing;
 static DWORD g_capVk, g_capMods;
 static HWND  g_settings;
 static volatile LONG g_autoUpdate;    /* off unless the user ticked the box */
+static int   g_wordTaken;              /* another program holds the one-word shortcut */
 static WCHAR g_updateVer[32];
 static WCHAR g_updateUrl[512];
 static char  g_updateHash[80];         /* "sha256:..." published by GitHub, if any */
@@ -201,7 +202,7 @@ static void BuildTables(void)
 #define WORD_UNKNOWN (-1)
 
 /* Decides one word: the side to convert it to, keep it, or unknown (no letters). */
-static int WordTarget(const WCHAR *w, size_t n, int *letters)
+static int WordTarget(const WCHAR *w, size_t n, int *letters, int keepCaps)
 {
     int a = 0, b = 0, capitals = 0;
     size_t i;
@@ -212,12 +213,24 @@ static int WordTarget(const WCHAR *w, size_t n, int *letters)
     }
     *letters = a + b;
     if (a + b == 0) return WORD_UNKNOWN;
-    if (capitals == a + b) return WORD_KEEP;
+    if (keepCaps && capitals == a + b) return WORD_KEEP;
     if (a == b) return WORD_UNKNOWN;
     return a > b ? SIDE_B : SIDE_A;
 }
 
 static int IsGap(WCHAR c) { return c == L' ' || c == L'\t' || c == L'\r' || c == L'\n'; }
+
+/* Capitals are kept only for a word on its own, like USB; in a sentence everything flips. */
+static int IsSingleWord(const WCHAR *in, size_t n)
+{
+    size_t i = 0, words = 0;
+    while (i < n) {
+        while (i < n && IsGap(in[i])) i++;
+        if (i < n) words++;
+        while (i < n && !IsGap(in[i])) i++;
+    }
+    return words == 1;
+}
 
 /* The letters can't show the language, so all of it is treated as typed on the current keyboard. */
 static int FlipByKeyboard(const WCHAR *in, size_t n, WCHAR *out, int currentSide)
@@ -225,6 +238,7 @@ static int FlipByKeyboard(const WCHAR *in, size_t n, WCHAR *out, int currentSide
     int target = currentSide == SIDE_B ? SIDE_A : SIDE_B;
     const WCHAR *map = target == SIDE_A ? g_toA : g_toB;
     size_t i = 0, e, k;
+    int single = IsSingleWord(in, n);
 
     memcpy(out, in, n * sizeof(WCHAR));
     out[n] = 0;
@@ -237,7 +251,7 @@ static int FlipByKeyboard(const WCHAR *in, size_t n, WCHAR *out, int currentSide
             if (IsCharAlphaW(in[k])) letters++;
             if (in[k] >= L'A' && in[k] <= L'Z') capitals++;
         }
-        if (letters && capitals == letters) continue;
+        if (single && letters && capitals == letters) continue;
         for (k = i; k < e; k++)
             if (map[in[k]]) out[k] = map[in[k]];
     }
@@ -247,17 +261,18 @@ static int FlipByKeyboard(const WCHAR *in, size_t n, WCHAR *out, int currentSide
 /* Flips word by word and returns the side most of the text ended up on. */
 static int FlipSpan(const WCHAR *in, size_t n, WCHAR *out, int currentSide)
 {
-    int count[2] = {0, 0}, prev = WORD_UNKNOWN, last, letters, t;
+    int count[2] = {0, 0}, prev = WORD_UNKNOWN, last, letters, t, single;
     size_t i = 0, e, k;
 
     if (g_sameAlpha) return FlipByKeyboard(in, n, out, currentSide);
+    single = IsSingleWord(in, n);
 
     /* A word with no letters, like a lone comma, follows the words around it. */
     while (i < n && prev == WORD_UNKNOWN) {
         while (i < n && IsGap(in[i])) i++;
         e = i;
         while (e < n && !IsGap(in[e])) e++;
-        t = WordTarget(in + i, e - i, &letters);
+        t = WordTarget(in + i, e - i, &letters, single);
         if (t >= 0) prev = t;
         i = e;
     }
@@ -272,7 +287,7 @@ static int FlipSpan(const WCHAR *in, size_t n, WCHAR *out, int currentSide)
         e = i;
         while (e < n && !IsGap(in[e])) e++;
         if (e == i) break;
-        t = WordTarget(in + i, e - i, &letters);
+        t = WordTarget(in + i, e - i, &letters, single);
         if (t == WORD_KEEP) continue;
         if (t == WORD_UNKNOWN) t = prev;
         prev = t;
@@ -339,7 +354,7 @@ static int RegisterHotkeys(void)
 {
     DWORD word = WordMods(g_hkMods);
     UnregisterHotkeys();
-    if (word) RegisterHotKey(g_wnd, HOTKEY_WORD, word | MOD_NOREPEAT, g_hkVk);
+    g_wordTaken = word && !RegisterHotKey(g_wnd, HOTKEY_WORD, word | MOD_NOREPEAT, g_hkVk);
     return RegisterHotKey(g_wnd, HOTKEY_ALL, g_hkMods | MOD_NOREPEAT, g_hkVk);
 }
 
@@ -569,8 +584,58 @@ static int NeedsPaste(const WCHAR *s, size_t n)
 
 /* Copies what is highlighted. Returns NULL when the application copied nothing.
    Editors such as VS Code copy the whole line when nothing is highlighted, which
-   is recognised by its single line break at the end and treated as nothing.
-   Several highlighted lines have a break earlier too, so they count as a selection. */
+   is recognised by its single line break at the end and treated as nothing. In other
+   programs that same shape is a real selection, such as a triple-clicked paragraph. */
+static int NameInList(const WCHAR *name, const WCHAR *const *list)
+{
+    for (; *list; list++)
+        if (!lstrcmpiW(name, *list)) return 1;
+    return 0;
+}
+
+/* Programs whose Ctrl+C copies the whole line when nothing is highlighted. */
+static int IsLineCopier(const WCHAR *app)
+{
+    static const WCHAR *const apps[] = {
+        L"Code.exe", L"Code - Insiders.exe", L"Cursor.exe", L"Windsurf.exe", L"VSCodium.exe",
+        L"sublime_text.exe", L"devenv.exe", L"EXCEL.EXE", L"idea64.exe", L"pycharm64.exe",
+        L"webstorm64.exe", L"clion64.exe", L"rider64.exe", L"goland64.exe", L"phpstorm64.exe",
+        L"rubymine64.exe", L"datagrip64.exe", L"studio64.exe", NULL };
+    return NameInList(app, apps);
+}
+
+static int IsTerminalApp(const WCHAR *app)
+{
+    static const WCHAR *const apps[] = {
+        L"WindowsTerminal.exe", L"mintty.exe", L"ConEmu.exe", L"ConEmu64.exe", L"putty.exe",
+        L"kitty.exe", L"Tabby.exe", L"Hyper.exe", L"wezterm-gui.exe", L"alacritty.exe", NULL };
+    return NameInList(app, apps);
+}
+
+static int IsTerminalClass(const WCHAR *cls)
+{
+    static const WCHAR *const classes[] = {
+        L"ConsoleWindowClass", L"CASCADIA_HOSTING_WINDOW_CLASS", L"mintty",
+        L"VirtualConsoleClass", L"PuTTY", NULL };
+    return NameInList(cls, classes);
+}
+
+static void WindowApp(HWND w, WCHAR *out, DWORD size)
+{
+    DWORD pid = 0, n = MAX_PATH;
+    WCHAR path[MAX_PATH];
+    HANDLE p;
+    out[0] = 0;
+    GetWindowThreadProcessId(w, &pid);
+    p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!p) return;
+    if (QueryFullProcessImageNameW(p, 0, path, &n)) {
+        const WCHAR *b = wcsrchr(path, L'\\');
+        lstrcpynW(out, b ? b + 1 : path, (int)size);
+    }
+    CloseHandle(p);
+}
+
 static int IsOneLineWithBreak(const WCHAR *text, size_t n)
 {
     size_t body = n;
@@ -578,7 +643,7 @@ static int IsOneLineWithBreak(const WCHAR *text, size_t n)
     return body < n && wcscspn(text, L"\r\n") >= body;
 }
 
-static WCHAR *CopySelected(int waitMs, int *copiedLine)
+static WCHAR *CopySelected(int waitMs, int lineCopier, int *copiedLine)
 {
     DWORD seq = GetClipboardSequenceNumber();
     WCHAR *text;
@@ -593,7 +658,7 @@ static WCHAR *CopySelected(int waitMs, int *copiedLine)
     Sleep(20); /* let the application finish writing the clipboard */
     text = ReadClipboardText();
     n = text ? wcslen(text) : 0;
-    if (n == 0 || IsOneLineWithBreak(text, n)) {
+    if (n == 0 || wcsspn(text, L"\r\n") == n || (lineCopier && IsOneLineWithBreak(text, n))) {
         if (n && copiedLine) *copiedLine = 1;
         free(text);
         return NULL;
@@ -623,8 +688,8 @@ static int ComputeFlip(const WCHAR *text, size_t n, int mode, int layout, HWND f
 
     if (mode == MODE_WORD) {
         start = n;
-        while (start > 0 && text[start - 1] == L' ') start--;
-        while (start > 0 && text[start - 1] != L' ') start--;
+        while (start > 0 && IsGap(text[start - 1])) start--;
+        while (start > 0 && !IsGap(text[start - 1])) start--;
     }
     len = n - start;
     target = FlipSpan(text + start, len, out + start, layout);
@@ -640,12 +705,14 @@ static int ComputeFlip(const WCHAR *text, size_t n, int mode, int layout, HWND f
     return target;
 }
 
-/* In a console window Ctrl+C would stop the running program, so FlipKey stays out. */
-static int IsConsole(HWND fg)
+/* In a terminal Ctrl+C would stop the running program, so FlipKey stays out. The terminal
+   inside an editor such as VS Code can't be told apart from the editor itself. */
+static int IsTerminal(HWND fg)
 {
-    WCHAR cls[64];
-    if (!GetClassNameW(fg, cls, 64)) return 0;
-    return !lstrcmpW(cls, L"ConsoleWindowClass") || !lstrcmpW(cls, L"CASCADIA_HOSTING_WINDOW_CLASS");
+    WCHAR cls[64], app[64];
+    if (GetClassNameW(fg, cls, 64) && IsTerminalClass(cls)) return 1;
+    WindowApp(fg, app, 64);
+    return IsTerminalApp(app);
 }
 
 static void FlipNow(HWND fg, int layout, int mode)
@@ -654,16 +721,19 @@ static void FlipNow(HWND fg, int layout, int mode)
     WCHAR *text, *out;
     size_t n;
     int target, copiedLine = 0;
-    WCHAR cls[32] = L"";
+    int lineCopier;
+    WCHAR cls[32] = L"", app[64];
 
-    SaveClipboard(&saved);
-    text = CopySelected(150, &copiedLine);
     GetClassNameW(fg, cls, 32);
+    WindowApp(fg, app, 64);
+    lineCopier = IsLineCopier(app);
+    SaveClipboard(&saved);
+    text = CopySelected(150, lineCopier, &copiedLine);
     /* Excel copies the cell when it is not being edited; Shift+Home would extend the selection. */
     if (!text && !(copiedLine && !lstrcmpW(cls, L"XLMAIN"))) {
         SendShiftHome();
         Sleep(30);
-        text = CopySelected(300, NULL);
+        text = CopySelected(300, lineCopier, NULL);
     }
     if (!text) {
         RestoreClipboard(&saved);
@@ -701,7 +771,7 @@ static DWORD WINAPI FlipWorker(LPVOID unused)
         WaitForSingleObject(g_flipEvent, INFINITE);
         WaitForKeysUp();
         fg = GetForegroundWindow();
-        if (!fg || IsConsole(fg)) continue;
+        if (!fg || IsTerminal(fg)) continue;
         layout = GetKeyboardLayout(GetWindowThreadProcessId(fg, NULL)) == g_hkl[SIDE_B]
                      ? SIDE_B : SIDE_A;
         FlipNow(fg, layout, (int)g_mode);
@@ -912,7 +982,8 @@ static int VersionNumber(const char *v)
     int part[3] = {0, 0, 0}, i = 0;
     if (*v == 'v' || *v == 'V') v++;
     for (; *v && i < 3; v++) {
-        if (*v >= '0' && *v <= '9') part[i] = part[i] * 10 + (*v - '0');
+        /* Each part is capped, so an absurd version number can't overflow. */
+        if (*v >= '0' && *v <= '9') { if (part[i] < 100) part[i] = part[i] * 10 + (*v - '0'); }
         else if (*v == '.') i++;
         else break;
     }
@@ -1046,7 +1117,7 @@ static void CheckForUpdate(void)
     char *json = HttpGet(L"https://api.github.com" RELEASE_PATH, &len);
     if (!json) return;
     if (ParseRelease(json, tag, sizeof tag, url, sizeof url, g_updateHash, sizeof g_updateHash) &&
-        VersionNumber(tag) > VersionNumber(APP_VER) &&
+        g_updateHash[0] && VersionNumber(tag) > VersionNumber(APP_VER) &&
         MultiByteToWideChar(CP_UTF8, 0, url, -1, g_updateUrl, 512)) {
         const char *t = (tag[0] == 'v' || tag[0] == 'V') ? tag + 1 : tag;
         MultiByteToWideChar(CP_UTF8, 0, t, -1, g_updateVer, 32);
@@ -1117,9 +1188,9 @@ static DWORD WINAPI InstallThread(LPVOID unused)
     data = HttpGet(g_updateUrl, &len);
     if (data) {
         char actual[80];
-        /* A published fingerprint must match; otherwise the file is not installed. */
-        if (!g_updateHash[0] ||
-            (Sha256Text(data, len, actual, sizeof actual) && !_stricmp(actual, g_updateHash)))
+        /* No fingerprint or a different one: the file is not installed. */
+        if (g_updateHash[0] && Sha256Text(data, len, actual, sizeof actual) &&
+            !_stricmp(actual, g_updateHash))
             ok = InstallBytes(exe, data, len);
         free(data);
     }
@@ -1211,6 +1282,8 @@ static void RefreshSettings(void)
         if (word) {
             HotkeyName(vk, word, name);
             wsprintfW(text, L"To flip only the last word: %s", name);
+        } else {
+            lstrcpyW(text, L"This key has no one-word shortcut.");
         }
     }
     SetDlgItemTextW(g_settings, IDC_WORD, text);
@@ -1426,7 +1499,7 @@ static void RunSettings(int firstRun)
     AddCtl(g_settings, L"STATIC", L"", 0, 24, 240, 352, 20, IDC_WORD, g_font);
     AddCtl(g_settings, L"BUTTON", L"Start FlipKey automatically with Windows",
            BS_AUTOCHECKBOX | WS_GROUP | WS_TABSTOP, 24, 276, 352, 24, IDC_STARTUP, g_font);
-    AddCtl(g_settings, L"BUTTON", L"Check for updates once a day",
+    AddCtl(g_settings, L"BUTTON", L"Check for updates at startup and daily",
            BS_AUTOCHECKBOX | WS_TABSTOP, 24, 302, 352, 24, IDC_UPDATES, g_font);
     AddCtl(g_settings, L"BUTTON", L"Save", BS_DEFPUSHBUTTON | WS_GROUP | WS_TABSTOP,
            192, 336, 88, 30, IDOK, g_font);
@@ -1464,6 +1537,9 @@ static void RunSettings(int firstRun)
     /* Closing the first-run window keeps F10 and does not ask again. */
     if (firstRun) SaveConfig();
     ApplyHotkey();
+    if (g_wordTaken && !g_paused)
+        MessageBoxW(NULL, L"Another program is using the one-word shortcut, so it won't work.\n"
+                          L"Your main key works normally.", APP_TITLE, MB_OK | MB_ICONWARNING);
 }
 
 static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
